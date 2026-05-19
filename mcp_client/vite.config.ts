@@ -42,8 +42,8 @@ export default defineConfig({
 	},
 	resolve: {
 		alias: {
-			// Fix ajv ES modules compatibility
-			'ajv': 'ajv/dist/ajv.min.js',
+			// ajv v8 does not ship ajv.min.js — redirect the MCP SDK's import to the main package
+			'ajv/dist/ajv.min.js': 'ajv',
 		},
 	},
 });

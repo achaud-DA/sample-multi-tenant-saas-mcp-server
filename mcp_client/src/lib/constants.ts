@@ -1,3 +1,6 @@
+/** BroadcastChannel name for OAuth callback when window.opener is unavailable (e.g. _blank tab). */
+export const OAUTH_CALLBACK_CHANNEL = "mcp-oauth-callback";
+
 // Session storage keys
 export const SESSION_KEYS = {
   SERVER_URL: "mcp_server_url",
@@ -6,6 +9,7 @@ export const SESSION_KEYS = {
   TOKENS: "mcp_tokens",
   CODE_VERIFIER: "mcp_code_verifier",
   SERVER_METADATA: "mcp_server_metadata",
+  DISCOVERY_STATE: "mcp_discovery_state",
 } as const;
 
 // Generate server-specific session storage key

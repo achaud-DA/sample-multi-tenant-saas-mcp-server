@@ -350,6 +350,11 @@ export class McpPlaygroundStack extends cdk.Stack {
     const mcpProxyAnyResource = mcpProxyResource.addResource('{proxy+}');
     mcpProxyAnyResource.addMethod('ANY', lambdaIntegration);
 
+    // Databricks OAuth metadata proxy (path-encoded target; CloudFront does not forward query strings)
+    const oauthDiscoveryResource = apiResource.addResource('oauth-discovery');
+    const oauthDiscoveryTargetResource = oauthDiscoveryResource.addResource('{target+}');
+    oauthDiscoveryTargetResource.addMethod('GET', lambdaIntegration);
+
     // Auth endpoints (if Cognito is enabled)
     if (this.userPool && this.userPoolClient) {
       const authResource = apiResource.addResource('auth');

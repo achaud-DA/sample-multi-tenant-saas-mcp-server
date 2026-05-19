@@ -1,4 +1,4 @@
-import { NagSuppressions, RegexAppliesTo } from 'cdk-nag';
+import { NagSuppressions } from 'cdk-nag';
 import { Stack } from 'aws-cdk-lib';
 
 export function addCommonSuppressions(stack: Stack) {
@@ -56,6 +56,10 @@ export function addCommonSuppressions(stack: Stack) {
     {
       id: 'AwsSolutions-COG1',
       reason: 'Password policy is configured with appropriate complexity requirements'
+    },
+    {
+      id: 'AwsSolutions-COG8',
+      reason: 'Cognito plus tier / advanced security features not required for demo application - enable in production for malicious sign-in detection'
     },
     {
       id: 'AwsSolutions-COG2',

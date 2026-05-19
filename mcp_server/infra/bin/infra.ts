@@ -38,6 +38,10 @@ const mcpServerApplicationStack = new ApplicationStack(app, 'MCPServerApplicatio
 // Add dependencies to ensure proper deployment order
 mcpServerApplicationStack.addDependency(mcpServerInfrastructureStack);
 
+// Apply resource tags to all resources in both stacks
+cdk.Tags.of(app).add('map-migrated', 'd-server-028bqm2pgp95c2');
+cdk.Tags.of(app).add('createdBy', 'anantc');
+
 // Add CDK Nag suppressions for demo purposes
 NagSuppressions.addStackSuppressions(mcpServerInfrastructureStack, [
   {

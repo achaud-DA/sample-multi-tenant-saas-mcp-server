@@ -58,40 +58,9 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const apiBaseUrl = getApiBaseUrl();
         const proxyUrl = `${apiBaseUrl}/api/mcp-proxy/${encodeURIComponent(url)}`;
         
-        const response = await originalFetch(proxyUrl, init);
-        
-        // Handle OAuth protected resource responses
-        if (url.includes('oauth-protected-resource') && response.ok && response.headers.get('content-type')?.includes('application/json')) {
-          console.log("🔧 Processing OAuth protected resource response for:", url);
-          const responseText = await response.text();
-          try {
-            const data = JSON.parse(responseText);
-            console.log("🔧 Original OAuth protected resource data:", data);
-            if (data.resource) {
-              // Replace the resource URL with the proxy URL
-              const originalResource = data.resource;
-              const proxyResource = `${apiBaseUrl}/api/mcp-proxy/${encodeURIComponent(originalResource)}`;
-              data.resource = proxyResource;
-              console.log("🔧 Modified OAuth protected resource:", originalResource, "→", proxyResource);
-              
-              return new Response(JSON.stringify(data), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers
-              });
-            }
-          } catch (e) {
-            console.warn("Failed to parse OAuth protected resource response:", e);
-          }
-          
-          return new Response(responseText, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers
-          });
-        }
-        
-        return response;
+        // Do not rewrite metadata.resource to the CloudFront proxy URL — Cognito
+        // authorization codes are bound to the real MCP resource (https://host/mcp).
+        return await originalFetch(proxyUrl, init);
       }
     } catch (error) {
       console.warn("Failed to parse URL for proxy check:", url);
