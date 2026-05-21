@@ -40,7 +40,7 @@ export async function handleOAuthDiscoveryProxy(targetParam: string): Promise<{
 
   if (!isAllowedOAuthDiscoveryTarget(target)) {
     return {
-      statusCode: 403,
+      statusCode: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({ error: "OAuth discovery target not allowed" }),
     };
@@ -56,8 +56,12 @@ export async function handleOAuthDiscoveryProxy(targetParam: string): Promise<{
   const contentType =
     response.headers.get("content-type") ?? "application/json";
 
+  // Avoid 404/403 from API origin — CloudFront maps those to index.html (breaks JSON clients)
+  const statusCode =
+    response.status === 404 || response.status === 403 ? 502 : response.status;
+
   return {
-    statusCode: response.status,
+    statusCode,
     headers: { ...corsHeaders, "Content-Type": contentType },
     body,
   };

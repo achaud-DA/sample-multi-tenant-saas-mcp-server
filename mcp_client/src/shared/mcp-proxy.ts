@@ -1,3 +1,5 @@
+import { MCP_CORS_ALLOW_HEADERS, MCP_CORS_EXPOSE_HEADERS } from './cors-config.js';
+
 export interface McpProxyRequest {
   method: string;
   url: string;
@@ -10,6 +12,62 @@ export interface McpProxyResponse {
   statusCode: number;
   headers: Record<string, string>;
   body: string;
+}
+
+/** Request headers forwarded to upstream MCP servers (Streamable HTTP session). */
+const MCP_FORWARD_REQUEST_HEADERS = [
+  'mcp-session-id',
+  'mcp-protocol-version',
+  'last-event-id',
+] as const;
+
+/** Response headers forwarded back to the browser (must match Access-Control-Expose-Headers). */
+const MCP_FORWARD_RESPONSE_HEADERS = [
+  'mcp-session-id',
+  'mcp-protocol-version',
+] as const;
+
+function isHtmlResponse(contentType: string | null, body: string): boolean {
+  if (contentType?.includes('text/html') || contentType?.includes('application/xhtml')) {
+    return true;
+  }
+  const start = body.trimStart().slice(0, 256).toLowerCase();
+  return start.startsWith('<!doctype') || start.startsWith('<html');
+}
+
+function htmlProxyErrorResponse(
+  upstreamStatus: number,
+  fullUrl: string,
+  bodySnippet: string,
+): McpProxyResponse {
+  console.error('MCP Proxy: upstream returned HTML', {
+    upstreamStatus,
+    fullUrl,
+    snippet: bodySnippet.slice(0, 300),
+  });
+  return {
+    statusCode: 502,
+    headers: buildCorsHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      error: 'upstream_html',
+      error_description:
+        'The MCP server (or CDN) returned HTML instead of JSON/SSE. Verify the MCP URL and bearer token match Cursor. If the playground SPA was deployed with CloudFront 404→index.html rules, redeploy the latest CDK stack.',
+      upstream_status: upstreamStatus,
+      upstream_url: fullUrl,
+    }),
+  };
+}
+
+function buildCorsHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': MCP_CORS_ALLOW_HEADERS,
+    'Access-Control-Expose-Headers': MCP_CORS_EXPOSE_HEADERS,
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    Pragma: 'no-cache',
+    ...extra,
+  };
 }
 
 export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxyResponse> {
@@ -52,8 +110,8 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
         /^172\.(1[6-9]|2[0-9]|3[01])\./.test(hostname) ||
         hostname === '169.254.169.254') {
       return {
-        statusCode: 403,
-        headers: { 'Content-Type': 'application/json' },
+        statusCode: 502,
+        headers: buildCorsHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ error: 'Access to internal networks blocked' })
       };
     }
@@ -67,21 +125,38 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
       };
     }
 
-    console.log(`MCP Proxy: ${request.method} ${fullUrl}`);
+    const sessionIdIn = getHeader(request.headers, 'mcp-session-id');
+    console.log(`MCP Proxy: ${request.method} ${fullUrl}${sessionIdIn ? ` (mcp-session-id present)` : ''}`);
+
+    const upstreamHeaders: Record<string, string> = {
+      'Content-Type': getHeader(request.headers, 'content-type') || 'application/json',
+      'Accept': 'application/json, text/event-stream',
+    };
+
+    const authorization = getHeader(request.headers, 'authorization');
+    if (authorization) {
+      upstreamHeaders['Authorization'] = authorization;
+    }
+
+    const customAuthHeaderName = getHeader(request.headers, 'x-custom-auth-header');
+    if (customAuthHeaderName) {
+      const customAuthValue = getHeader(request.headers, customAuthHeaderName);
+      if (customAuthValue) {
+        upstreamHeaders[customAuthHeaderName] = customAuthValue;
+      }
+    }
+
+    for (const name of MCP_FORWARD_REQUEST_HEADERS) {
+      const value = getHeader(request.headers, name);
+      if (value) {
+        upstreamHeaders[name] = value;
+      }
+    }
 
     const fetchOptions: RequestInit = {
       method: request.method,
-      headers: {
-        'Content-Type': getHeader(request.headers, 'content-type') || 'application/json',
-        'Accept': 'application/json, text/event-stream',
-        // Forward authorization and custom headers
-        ...(getHeader(request.headers, 'authorization') && { 
-          'Authorization': getHeader(request.headers, 'authorization')! 
-        }),
-        ...(getHeader(request.headers, 'x-custom-auth-header') && getHeader(request.headers, getHeader(request.headers, 'x-custom-auth-header')!) && {
-          [getHeader(request.headers, 'x-custom-auth-header')!]: getHeader(request.headers, getHeader(request.headers, 'x-custom-auth-header')!)!
-        }),
-      },
+      headers: upstreamHeaders,
+      cache: 'no-store',
     };
 
     // Handle body for non-GET requests
@@ -108,12 +183,7 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
           
           return {
             statusCode: 400,
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-              'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-            },
+            headers: buildCorsHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               error: 'invalid_client_metadata',
               error_description: 'Dynamic client registration is not supported by this server. Please use pre-configured client credentials or contact the server administrator for access.'
@@ -126,13 +196,8 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
           console.log('Server does not support OAuth authorization server discovery, providing fallback response');
           
           return {
-            statusCode: 404,
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-              'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-            },
+            statusCode: 502,
+            headers: buildCorsHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               error: 'not_found',
               error_description: 'OAuth authorization server discovery is not supported by this server. Please use manual authentication or contact the server administrator for access.'
@@ -144,6 +209,12 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
 
     // Get response body first
     const responseBody = await response.text();
+    const upstreamContentType = response.headers.get('content-type');
+
+    // HTML usually means CloudFront SPA fallback (index.html) or API Gateway error page — not valid MCP
+    if (isHtmlResponse(upstreamContentType, responseBody)) {
+      return htmlProxyErrorResponse(response.status, fullUrl, responseBody);
+    }
 
     // Handle OAuth registration responses that might have incorrect Content-Type
     if (request.method === 'POST' && fullUrl.includes('/register') && (response.status === 400 || response.status === 404)) {
@@ -155,12 +226,7 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
           
           return {
             statusCode: response.status,
-            headers: {
-              'Content-Type': 'application/json',
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-              'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-            },
+            headers: buildCorsHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(jsonData), // Ensure it's properly stringified
           };
         }
@@ -169,14 +235,8 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
       }
     }
 
-    // Build response headers
-    const responseHeaders: Record<string, string> = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-custom-auth-header',
-    };
+    const responseHeaders = buildCorsHeaders();
 
-    // Forward important headers from the response
     const contentType = response.headers.get('content-type');
     if (contentType) {
       responseHeaders['Content-Type'] = contentType;
@@ -187,8 +247,25 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
       responseHeaders['WWW-Authenticate'] = wwwAuth;
     }
 
+    for (const name of MCP_FORWARD_RESPONSE_HEADERS) {
+      const value = response.headers.get(name);
+      if (value) {
+        responseHeaders[name] = value;
+      }
+    }
+
+    // Do not forward validators that cause 304 responses on repeated SSE GETs
+    delete responseHeaders['etag'];
+    delete responseHeaders['ETag'];
+    delete responseHeaders['last-modified'];
+    delete responseHeaders['Last-Modified'];
+
+    // CloudFront custom errors map origin 404/403 → index.html; use 502 for those statuses
+    const statusCode =
+      response.status === 404 || response.status === 403 ? 502 : response.status;
+
     return {
-      statusCode: response.status,
+      statusCode,
       headers: responseHeaders,
       body: responseBody,
     };
@@ -197,12 +274,7 @@ export async function handleMcpProxy(request: McpProxyRequest): Promise<McpProxy
     console.error('MCP Proxy error:', error);
     return {
       statusCode: 500,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-custom-auth-header',
-        'Content-Type': 'application/json'
-      },
+      headers: buildCorsHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         error: 'Proxy error',
         details: error instanceof Error ? error.message : 'Unknown error',

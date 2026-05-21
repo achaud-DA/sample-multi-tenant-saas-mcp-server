@@ -83,6 +83,56 @@ cd ..
 
 ---
 
+## MCP server shows Connected but 0 tools (API Gateway / Streamable HTTP)
+
+**Symptoms:** Playground status is **Connected**, tool list is empty; Cursor shows tools for the same URL. Browser console may show `Failed to load server data`.
+
+**Cause:** Streamable HTTP requires `mcp-session-id` after `initialize`. Three layers must pass it:
+
+1. **Lambda proxy** (`mcp-proxy.ts`) — forwards `mcp-session-id` / `mcp-protocol-version` and sets `Access-Control-Expose-Headers`
+2. **API Gateway CORS** — allows those headers on preflight (`mcp-playground-stack.ts`)
+3. **CloudFront** — must **forward** viewer headers to API Gateway (`forwardedValues.headers` on the `api/*` behavior). Without this, CloudFront drops `mcp-session-id` and `Authorization` before they reach Lambda.
+
+**Fix:** Redeploy CDK (not only the static site):
+
+```bash
+cd mcp_client && ./deploy.sh
+```
+
+**Verify in DevTools → Network:** After `initialize`, the proxied response should include `mcp-session-id`; the next POST should send `mcp-session-id` in request headers.
+
+## OAuth redirect: S3 `NoSuchKey` for `/oauth/callback`
+
+**Symptoms:** Browser shows XML `NoSuchKey` / `The specified key does not exist` for `oauth/callback` after MCP OAuth login.
+
+**Cause:** The React app is a SPA; S3 has no file at `oauth/callback`. CloudFront must serve `index.html` for that path (custom error 404→`/index.html`).
+
+**Fix:** Redeploy CDK so `errorConfigurations` are present on the distribution. Hard-refresh and retry OAuth.
+
+---
+
+## Error: `Unexpected content type: text/html`
+
+**Symptoms:** Console shows `Streamable HTTP error: Unexpected content type: text/html`; Network shows **200** on `/api/mcp-proxy/...` but tools stay at 0.
+
+**Cause:** CloudFront **custom error responses** turn origin **404/403** into **`/index.html`**. That is required for SPA routes like `/oauth/callback`, but if the **API** returns 404/403, MCP calls get HTML instead of JSON/SSE.
+
+**Fix:** Redeploy latest CDK + Lambda. API handlers use **502** (not 404/403); `mcp-proxy` detects HTML. SPA fallback stays enabled for `/oauth/callback`.
+
+**Also verify:** MCP URL matches Cursor exactly (e.g. `https://5bqjluycme.execute-api.us-east-1.amazonaws.com/mcp` — no extra characters).
+
+---
+
+### Many GET requests with status 304
+
+**Symptoms:** Network tab shows repeated `fetch` calls to `/api/mcp-proxy/...` with **304 Not Modified** (initiator `main.tsx`).
+
+**Cause:** Browser or CloudFront cached the MCP SSE GET. Streamable HTTP needs a live response body; 304 returns no body and tools never load.
+
+**Fix:** Redeploy after proxy changes (`Cache-Control: no-store` on proxy responses + `cache: 'no-store'` on browser fetch). Hard-refresh the page (Ctrl+Shift+R) after deploy.
+
+---
+
 ## Error 4: CDK Nag blocks deployment — `AwsSolutions-COG8`
 
 **When it appears:** During CDK synthesis/deployment

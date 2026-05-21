@@ -234,25 +234,46 @@ export function useMcpConnection({
   };
 
   const loadServerData = async (mcpClient: Client) => {
-    try {
-      // Load tools
-      const toolsResponse = await mcpClient.request(
-        { method: "tools/list" },
-        ListToolsResultSchema
-      );
-      
-      // Load resources
-      const resourcesResponse = await mcpClient.request(
-        { method: "resources/list" },
-        ListResourcesResultSchema
-      );
-      
-      // Load prompts
-      const promptsResponse = await mcpClient.request(
-        { method: "prompts/list" },
-        ListPromptsResultSchema
-      );
+    const skipped: string[] = [];
 
+    let toolsResponse = { tools: [] as Tool[] };
+    try {
+      toolsResponse = await mcpClient.request(
+        { method: "tools/list" },
+        ListToolsResultSchema,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn("Failed to load tools:", error);
+      updateState({
+        error: `Connected but tools/list failed: ${detail}`,
+      });
+      return;
+    }
+
+    let resourcesResponse = { resources: [] as Resource[] };
+    try {
+      resourcesResponse = await mcpClient.request(
+        { method: "resources/list" },
+        ListResourcesResultSchema,
+      );
+    } catch (error) {
+      console.warn("resources/list not available:", error);
+      skipped.push("resources");
+    }
+
+    let promptsResponse = { prompts: [] as Prompt[] };
+    try {
+      promptsResponse = await mcpClient.request(
+        { method: "prompts/list" },
+        ListPromptsResultSchema,
+      );
+    } catch (error) {
+      console.warn("prompts/list not available:", error);
+      skipped.push("prompts");
+    }
+
+    try {
       // Attach callTool method to each tool - capture mcpClient in closure
       const toolsWithCallTool = (toolsResponse.tools || []).map((tool: any) => ({
         ...tool,
@@ -319,10 +340,17 @@ export function useMcpConnection({
         tools: toolsWithCallTool,
         resources: resourcesWithReadResource,
         prompts: promptsWithGetPrompt,
+        error:
+          skipped.length > 0
+            ? `Connected (${toolsWithCallTool.length} tools). Optional features unavailable: ${skipped.join(", ")}.`
+            : null,
       });
     } catch (error) {
-      console.warn("Failed to load server data:", error);
-      // Don't treat this as a fatal error
+      console.warn("Failed to process server data:", error);
+      const detail = error instanceof Error ? error.message : String(error);
+      updateState({
+        error: `Connected but failed to process server data: ${detail}`,
+      });
     }
   };
 

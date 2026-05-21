@@ -11,8 +11,8 @@ export type InferenceParams = {
 };
 export declare function createInferenceHandler(params: InferenceParams): Promise<import("ai").StreamTextResult<{
     [k: string]: {
-        description: string;
-        parameters: import("ai").Schema<unknown> | {
+        description: string | undefined;
+        parameters: import("@ai-sdk/ui-utils").Schema<unknown> | {
             type: string;
         };
     };

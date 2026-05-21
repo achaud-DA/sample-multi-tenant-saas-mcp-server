@@ -63,7 +63,7 @@ export const handler = async (
       const proxyResponse = await handleOAuthDiscoveryProxy(target);
       return {
         statusCode: proxyResponse.statusCode,
-        headers: proxyResponse.headers,
+        headers: { ...corsHeaders, ...proxyResponse.headers },
         body: proxyResponse.body,
       };
     }
@@ -73,8 +73,8 @@ export const handler = async (
       return await handleMcpProxyLambda(event);
     }
 
-    // Route not found
-    return createLambdaResponse(404, createErrorResponse('Route not found'));
+    // Use 502 (not 404) so CloudFront SPA custom-error rules do not replace JSON with index.html
+    return createLambdaResponse(502, createErrorResponse('Route not found', path));
   } catch (error) {
     console.error('Handler error:', error);
     return createLambdaResponse(500, createErrorResponse(
@@ -164,12 +164,21 @@ async function handleInference(event: APIGatewayProxyEvent): Promise<APIGatewayP
   }
 }
 
+function buildMcpProxyPath(event: APIGatewayProxyEvent): string {
+  const normalized = event.path.replace(/^\/[^/]+(?=\/api\/)/, '') || event.path;
+  const proxySegment = event.pathParameters?.proxy;
+  if (proxySegment) {
+    return `/api/mcp-proxy/${proxySegment}`;
+  }
+  return normalized;
+}
+
 async function handleMcpProxyLambda(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   return await handleMcpProxy({
     method: event.httpMethod,
-    url: event.path,
+    url: buildMcpProxyPath(event),
     headers: event.headers,
     body: event.body,
-    queryStringParameters: event.queryStringParameters
+    queryStringParameters: event.queryStringParameters,
   });
 }
