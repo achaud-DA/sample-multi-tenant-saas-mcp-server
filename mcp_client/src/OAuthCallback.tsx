@@ -83,19 +83,23 @@ export default function OAuthCallback() {
         }
 
         setStatus("success");
-        setMessage("Authorization successful! Closing window...");
 
         const payload = { type: "oauth_success" as const, code, state };
+        const hasOpener = !!(window.opener && !window.opener.closed);
 
-        // Use one channel only — both can fire and race token exchange (invalid_grant)
-        if (window.opener && !window.opener.closed) {
+        if (hasOpener) {
+          setMessage("Authorization successful! Returning to the playground...");
           console.log("Sending postMessage to parent window");
           try {
             window.opener.postMessage(payload, window.location.origin);
+            window.opener.focus();
           } catch (err) {
             console.error("Failed to send postMessage:", err);
           }
         } else {
+          setMessage(
+            "Authorization successful! Close this tab and return to your MCP Playground tab to finish connecting.",
+          );
           try {
             const channel = new BroadcastChannel(OAUTH_CALLBACK_CHANNEL);
             channel.postMessage(payload);
@@ -106,12 +110,11 @@ export default function OAuthCallback() {
         }
 
         setTimeout(() => {
-          if (window.opener && !window.opener.closed) {
+          // Do not navigate to / — that opens a second playground and forces demo login again.
+          if (hasOpener) {
             window.close();
-          } else {
-            navigate("/");
           }
-        }, 1000);
+        }, 1500);
 
       } catch (error) {
         console.error("OAuth callback error:", error);
@@ -151,7 +154,7 @@ export default function OAuthCallback() {
           
           {status === "success" && (
             <p className="text-sm text-gray-500 mt-4">
-              Redirecting back to the application...
+              You can close this window — the playground tab will finish connecting automatically.
             </p>
           )}
           

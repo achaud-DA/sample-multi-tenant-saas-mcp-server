@@ -542,24 +542,24 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
       throw new Error("Authorization URL must be HTTP or HTTPS");
     }
 
-    // Use a new tab instead of popup to avoid popup blockers
-    // Store the current window reference for communication
-    const originalWindow = window;
-    
-    // Open OAuth flow in a new tab
+    // Popup keeps window.opener more reliably than _blank after Cognito redirects.
     const authTab = window.open(
       authorizationUrl.href,
-      '_blank'
+      "mcp_oauth",
+      "popup,width=520,height=720,noopener=no,noreferrer=no",
     );
 
     if (!authTab) {
-      throw new Error("Failed to open OAuth tab. Please allow popups/new tabs for this site.");
+      throw new Error(
+        "Failed to open OAuth window. Allow popups for this site and try again.",
+      );
     }
 
-    // Wait for the tab to complete the OAuth flow
+    // Wait for the popup to complete the OAuth flow
     return new Promise((resolve, reject) => {
       let settled = false;
-      let checkClosedInterval: ReturnType<typeof setInterval> | undefined;
+      let pollInterval: ReturnType<typeof setInterval> | undefined;
+      let popupClosedAt: number | null = null;
       const oauthChannel =
         typeof BroadcastChannel !== "undefined"
           ? new BroadcastChannel(OAUTH_CALLBACK_CHANNEL)
@@ -567,11 +567,15 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
 
       const cleanup = () => {
         window.removeEventListener("message", messageListener);
+        window.removeEventListener("storage", storageListener);
         oauthChannel?.close();
-        if (checkClosedInterval) {
-          clearInterval(checkClosedInterval);
+        if (pollInterval) {
+          clearInterval(pollInterval);
         }
       };
+
+      const readPendingAuthCode = (): string | null =>
+        sessionStorage.getItem("oauth_authorization_code");
 
       const finishWithCode = (code: string) => {
         if (settled) return;
@@ -589,6 +593,11 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
 
       const handleOAuthSuccess = (code: string) => {
         console.log("Received OAuth authorization code");
+        try {
+          window.focus();
+        } catch {
+          /* ignore */
+        }
         finishWithCode(code);
       };
 
@@ -614,7 +623,16 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
 
       window.addEventListener("message", messageListener);
 
-      // BroadcastChannel fallback when callback tab has no window.opener (_blank tab)
+      // Callback writes code to sessionStorage before BroadcastChannel; storage event is reliable
+      const storageListener = (event: StorageEvent) => {
+        if (event.key !== "oauth_authorization_code" || !event.newValue || settled) {
+          return;
+        }
+        handleOAuthSuccess(event.newValue);
+      };
+      window.addEventListener("storage", storageListener);
+
+      // BroadcastChannel fallback when callback popup has no window.opener
       oauthChannel?.addEventListener("message", (event: MessageEvent) => {
         if (event.data?.type === "oauth_success" && event.data.code) {
           handleOAuthSuccess(event.data.code);
@@ -623,19 +641,30 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
         }
       });
 
-      // Check periodically if the tab is closed manually
-      checkClosedInterval = setInterval(() => {
-        if (authTab.closed) {
-          if (settled) return;
+      // Poll for code (popup may report closed briefly during Cognito redirects)
+      pollInterval = setInterval(() => {
+        if (settled) return;
 
-          const authCode = sessionStorage.getItem("oauth_authorization_code");
-          if (authCode) {
-            finishWithCode(authCode);
-          } else {
-            handleOAuthFailure("OAuth flow was cancelled or failed");
-          }
+        const authCode = readPendingAuthCode();
+        if (authCode) {
+          finishWithCode(authCode);
+          return;
         }
-      }, 1000);
+
+        if (authTab.closed) {
+          if (!popupClosedAt) {
+            popupClosedAt = Date.now();
+          }
+          // Wait for callback page to finish writing the code before failing
+          if (Date.now() - popupClosedAt > 20_000) {
+            handleOAuthFailure(
+              "OAuth flow was cancelled or timed out. Close the OAuth popup after you see success, or click Connect again.",
+            );
+          }
+        } else {
+          popupClosedAt = null;
+        }
+      }, 400);
 
       // Timeout after 10 minutes (longer than popup since users might take more time in a tab)
       setTimeout(() => {

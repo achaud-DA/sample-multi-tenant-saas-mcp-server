@@ -28,7 +28,7 @@ import {
   seedDatabricksOAuthDiscovery,
   type McpOAuthServerInfo,
 } from "../lib/auth";
-import { ConnectionStatus } from "../lib/constants";
+import { ConnectionStatus, SESSION_KEYS } from "../lib/constants";
 import { z } from "zod";
 import { McpConnectionState, EMPTY_MCP_CONNECTION_STATE } from "../lib/auth-types";
 import {
@@ -108,6 +108,9 @@ export function useMcpConnection({
       }
       
       updateState({ status: "authenticating" });
+
+      sessionStorage.setItem(SESSION_KEYS.PENDING_CONNECT_URL, url);
+      sessionStorage.setItem(SESSION_KEYS.LAST_SERVER_URL, url);
       
       let serverAuthProvider: PlaygroundOAuthClientProvider | null = null;
       
@@ -357,6 +360,8 @@ export function useMcpConnection({
   const connect = async (url: string, retryCount: number = 0) => {
     if (!url) return;
 
+    sessionStorage.setItem(SESSION_KEYS.LAST_SERVER_URL, url);
+
     updateState({ 
       status: "connecting", 
       serverUrl: url, 
@@ -426,11 +431,11 @@ export function useMcpConnection({
             false,
             retryCount,
           );
-          if (!oauthReady) {
+          token = (await serverAuthProvider.tokens())?.access_token;
+          if (!oauthReady && !token) {
             return;
           }
           updateState({ status: "connecting", serverUrl: url, error: null });
-          token = (await serverAuthProvider.tokens())?.access_token;
         }
       }
       
@@ -477,6 +482,7 @@ export function useMcpConnection({
       
       setClient(mcpClient);
       updateState({ status: "connected" });
+      sessionStorage.removeItem(SESSION_KEYS.PENDING_CONNECT_URL);
 
       // Load server data
       await loadServerData(mcpClient);
