@@ -10,6 +10,12 @@ const getApiBaseUrl = () => {
   return window.location.origin;
 };
 
+/** MCP/SSE must not be cached — 304 breaks Streamable HTTP session and tools/list. */
+const withNoStore = (init?: RequestInit): RequestInit => ({
+  ...init,
+  cache: 'no-store',
+});
+
 // Global fetch interceptor for OAuth URL fixing
 const originalFetch = window.fetch;
 window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -48,7 +54,7 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       const skipProxyPatterns = [/\.amazoncognito\.com$/, /cognito-idp\./, /cognito-identity\./];
       
       if (parsedUrl.pathname.startsWith('/api/mcp-proxy/')) {
-        return originalFetch(url, init);
+        return originalFetch(url, withNoStore(init));
       }
       
       const shouldSkipProxy = skipProxyHosts.includes(hostname) || 
@@ -57,41 +63,31 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       if (!shouldSkipProxy) {
         const apiBaseUrl = getApiBaseUrl();
         const proxyUrl = `${apiBaseUrl}/api/mcp-proxy/${encodeURIComponent(url)}`;
-        
-        const response = await originalFetch(proxyUrl, init);
-        
-        // Handle OAuth protected resource responses
-        if (url.includes('oauth-protected-resource') && response.ok && response.headers.get('content-type')?.includes('application/json')) {
-          console.log("🔧 Processing OAuth protected resource response for:", url);
-          const responseText = await response.text();
-          try {
-            const data = JSON.parse(responseText);
-            console.log("🔧 Original OAuth protected resource data:", data);
-            if (data.resource) {
-              // Replace the resource URL with the proxy URL
-              const originalResource = data.resource;
-              const proxyResource = `${apiBaseUrl}/api/mcp-proxy/${encodeURIComponent(originalResource)}`;
-              data.resource = proxyResource;
-              console.log("🔧 Modified OAuth protected resource:", originalResource, "→", proxyResource);
-              
-              return new Response(JSON.stringify(data), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers
-              });
-            }
-          } catch (e) {
-            console.warn("Failed to parse OAuth protected resource response:", e);
+
+        // Preserve headers when the SDK passes a Request object (not only init).
+        let proxyInit = init;
+        if (input instanceof Request) {
+          const mergedHeaders = new Headers(input.headers);
+          if (init?.headers) {
+            new Headers(init.headers).forEach((value, key) => mergedHeaders.set(key, value));
           }
-          
-          return new Response(responseText, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers
-          });
+          proxyInit = {
+            method: init?.method ?? input.method,
+            headers: mergedHeaders,
+            body: init?.body ?? (input.method !== 'GET' && input.method !== 'HEAD' ? input.body : undefined),
+            signal: init?.signal ?? input.signal,
+            credentials: init?.credentials ?? input.credentials,
+            cache: init?.cache ?? input.cache,
+            redirect: init?.redirect ?? input.redirect,
+            referrer: init?.referrer ?? input.referrer,
+            integrity: init?.integrity ?? input.integrity,
+            mode: init?.mode ?? input.mode,
+          };
         }
-        
-        return response;
+
+        // Do not rewrite metadata.resource to the CloudFront proxy URL — Cognito
+        // authorization codes are bound to the real MCP resource (https://host/mcp).
+        return await originalFetch(proxyUrl, withNoStore(proxyInit));
       }
     } catch (error) {
       console.warn("Failed to parse URL for proxy check:", url);

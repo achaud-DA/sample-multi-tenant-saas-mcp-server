@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { useMcpConnection } from "./hooks/useMcpConnection";
 import { PlaygroundOAuthClientProvider } from "./lib/auth";
+import { OAUTH_CALLBACK_CHANNEL, SESSION_KEYS } from "./lib/constants";
 
 interface McpServersProps {
   onToolsUpdate: (tools: any[]) => void;
@@ -9,7 +10,9 @@ interface McpServersProps {
 }
 
 export default function McpServers({ onToolsUpdate, onResourcesUpdate, onPromptsUpdate }: McpServersProps) {
-  const [serverUrl, setServerUrl] = useState("");
+  const [serverUrl, setServerUrl] = useState(
+    () => sessionStorage.getItem(SESSION_KEYS.LAST_SERVER_URL) ?? "",
+  );
   const [bearerToken, setBearerToken] = useState("");
   const [headerName, setHeaderName] = useState("");
   const [transportType, setTransportType] = useState<"auto" | "http" | "sse">("auto");
@@ -42,6 +45,66 @@ export default function McpServers({ onToolsUpdate, onResourcesUpdate, onPrompts
       console.error("MCP Connection Error:", error);
     },
   });
+
+  // After OAuth in another tab/window, resume connect on this tab when tokens are ready
+  React.useEffect(() => {
+    const pendingUrl = sessionStorage.getItem(SESSION_KEYS.PENDING_CONNECT_URL);
+    if (!pendingUrl || isConnected || isConnecting || isAuthenticating) {
+      return;
+    }
+
+    const resume = async () => {
+      const { getMcpProxyUrl } = await import("./lib/config");
+      const proxyUrl = getMcpProxyUrl(pendingUrl);
+      const authProvider = new PlaygroundOAuthClientProvider(
+        pendingUrl,
+        undefined,
+        proxyUrl,
+        usePreregisteredClient ? clientId : undefined,
+        usePreregisteredClient ? clientSecret : undefined,
+      );
+      const tokens = await authProvider.tokens();
+      if (tokens?.access_token) {
+        console.log("Resuming MCP connect after OAuth callback");
+        if (!serverUrl) {
+          setServerUrl(pendingUrl);
+        }
+        connect(pendingUrl);
+      }
+    };
+
+    const onOAuthDone = (event: MessageEvent) => {
+      if (event.data?.type !== "oauth_success") {
+        return;
+      }
+      void resume();
+    };
+
+    window.addEventListener("message", onOAuthDone);
+    let channel: BroadcastChannel | undefined;
+    try {
+      channel = new BroadcastChannel(OAUTH_CALLBACK_CHANNEL);
+      channel.addEventListener("message", onOAuthDone);
+    } catch {
+      /* BroadcastChannel optional */
+    }
+
+    void resume();
+
+    return () => {
+      window.removeEventListener("message", onOAuthDone);
+      channel?.close();
+    };
+  }, [
+    isConnected,
+    isConnecting,
+    isAuthenticating,
+    connect,
+    serverUrl,
+    usePreregisteredClient,
+    clientId,
+    clientSecret,
+  ]);
 
   // Update parent component when tools change
   React.useEffect(() => {
@@ -134,12 +197,14 @@ export default function McpServers({ onToolsUpdate, onResourcesUpdate, onPrompts
 
   const handleConnect = () => {
     if (serverUrl.trim()) {
+      const url = serverUrl.trim();
+      sessionStorage.setItem(SESSION_KEYS.LAST_SERVER_URL, url);
       // Auto-hide Manual Authentication if checked but no token provided
       if (useManualAuth && !bearerToken.trim()) {
         setUseManualAuth(false);
       }
       
-      connect(serverUrl.trim());
+      connect(url);
     }
   };
 

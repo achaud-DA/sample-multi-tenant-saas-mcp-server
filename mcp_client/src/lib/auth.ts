@@ -1,4 +1,7 @@
-import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  OAuthClientProvider,
+  OAuthDiscoveryState,
+} from "@modelcontextprotocol/sdk/client/auth.js";
 import {
   OAuthClientInformationSchema,
   OAuthClientInformation,
@@ -7,13 +10,197 @@ import {
   OAuthClientMetadata,
   OAuthMetadata,
   OAuthProtectedResourceMetadata,
+  OpenIdProviderDiscoveryMetadataSchema,
+  OAuthMetadataSchema,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { 
+import {
   discoverAuthorizationServerMetadata,
-  discoverOAuthProtectedResourceMetadata 
+  discoverOAuthProtectedResourceMetadata,
+  discoverOAuthServerInfo,
+  exchangeAuthorization,
+  selectResourceURL,
 } from "@modelcontextprotocol/sdk/client/auth.js";
-import { SESSION_KEYS, getServerSpecificKey } from "./constants";
+import { OAuthError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { OAUTH_CALLBACK_CHANNEL, SESSION_KEYS, getServerSpecificKey } from "./constants";
+import {
+  createDatabricksOAuthFetch,
+  getDatabricksProtectedResourceMetadataUrl,
+  getOAuthDiscoveryUrl,
+  isDatabricksMcpUrl,
+} from "./config";
 import { generateOAuthState } from "../utils/oauthUtils";
+
+function formatOAuthError(error: unknown): string {
+  if (error instanceof OAuthError) {
+    const desc = error.message || "no description";
+    return `${error.errorCode}: ${desc}`;
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === "object" && error !== null) {
+    const record = error as Record<string, unknown>;
+    if (typeof record.error_description === "string") {
+      return record.error_description;
+    }
+    if (typeof record.error === "string") {
+      return record.error;
+    }
+  }
+  return String(error);
+}
+
+/** Cognito may appear as cognito-idp… or {pool}.auth.{region}.amazoncognito.com (see token_endpoint). */
+type FetchFn = typeof fetch;
+
+export type McpOAuthServerInfo = Awaited<ReturnType<typeof discoverMcpOAuthServerInfo>>;
+
+async function fetchDatabricksAuthorizationServerMetadata(
+  workspaceOrigin: string,
+  fetchFn?: FetchFn,
+): Promise<OAuthMetadata | undefined> {
+  const metadataUrl = `${workspaceOrigin}/oidc/.well-known/oauth-authorization-server`;
+  const fn = fetchFn ?? fetch;
+  try {
+    const response = await fn(metadataUrl, {
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+    const json = await response.json();
+    try {
+      return OAuthMetadataSchema.parse(json);
+    } catch {
+      return OpenIdProviderDiscoveryMetadataSchema.parse(json);
+    }
+  } catch (error) {
+    console.debug("Direct Databricks OIDC metadata fetch failed:", error);
+    return undefined;
+  }
+}
+
+/** Discover OAuth for Databricks external MCP (workspace root PRM returns HTML). */
+export async function discoverMcpOAuthServerInfo(
+  serverUrl: string,
+  fetchFn?: FetchFn,
+) {
+  const discoveryUrl = getOAuthDiscoveryUrl(serverUrl);
+
+  if (!isDatabricksMcpUrl(serverUrl)) {
+    return discoverOAuthServerInfo(discoveryUrl, { fetchFn });
+  }
+
+  const workspaceOrigin = new URL(serverUrl).origin;
+  const resourceMetadataUrl = getDatabricksProtectedResourceMetadataUrl(serverUrl);
+
+  // 1) RFC 9728 on the external MCP connection path
+  try {
+    const resourceMetadata = await discoverOAuthProtectedResourceMetadata(
+      discoveryUrl,
+      { resourceMetadataUrl },
+      fetchFn,
+    );
+    const authorizationServerUrl =
+      resourceMetadata.authorization_servers?.[0] ?? workspaceOrigin;
+    const authorizationServerMetadata =
+      await discoverAuthorizationServerMetadata(authorizationServerUrl, {
+        fetchFn,
+      });
+    if (authorizationServerMetadata?.authorization_endpoint) {
+      return { authorizationServerUrl, authorizationServerMetadata, resourceMetadata };
+    }
+  } catch (error) {
+    console.debug("Databricks PRM discovery on external URL failed:", error);
+  }
+
+  // 2) Workspace OIDC metadata document (known-good URL for Databricks workspaces)
+  const directMetadata = await fetchDatabricksAuthorizationServerMetadata(
+    workspaceOrigin,
+    fetchFn,
+  );
+  if (directMetadata?.authorization_endpoint) {
+    const resourceMetadata = {
+      resource: discoveryUrl,
+      authorization_servers: [workspaceOrigin],
+      scopes_supported: directMetadata.scopes_supported ?? ["all-apis"],
+      bearer_methods_supported: ["header"],
+    };
+    return {
+      authorizationServerUrl: workspaceOrigin,
+      authorizationServerMetadata: directMetadata,
+      resourceMetadata,
+    };
+  }
+
+  // 3) RFC 8414 discovery via issuer base URLs
+  const oidcIssuerCandidates = [`${workspaceOrigin}/oidc`, workspaceOrigin];
+
+  for (const oidcIssuer of oidcIssuerCandidates) {
+    try {
+      const authorizationServerMetadata =
+        await discoverAuthorizationServerMetadata(oidcIssuer, { fetchFn });
+      if (!authorizationServerMetadata?.authorization_endpoint) {
+        continue;
+      }
+      const resourceMetadata = {
+        resource: discoveryUrl,
+        authorization_servers: [workspaceOrigin],
+        scopes_supported:
+          authorizationServerMetadata.scopes_supported ?? ["all-apis"],
+        bearer_methods_supported: ["header"],
+      };
+      return {
+        authorizationServerUrl: workspaceOrigin,
+        authorizationServerMetadata,
+        resourceMetadata,
+      };
+    } catch (error) {
+      console.debug("Databricks OIDC discovery failed for", oidcIssuer, error);
+    }
+  }
+
+  throw new Error(
+    "Could not discover Databricks OAuth metadata. Verify the External MCP URL and OAuth app redirect URI.",
+  );
+}
+
+/** RFC 9728 resource metadata for OAuth scope discovery (Databricks uses external path, not workspace root). */
+export async function discoverMcpResourceMetadata(
+  serverUrl: string,
+  fetchFn?: FetchFn,
+): Promise<OAuthProtectedResourceMetadata | undefined> {
+  try {
+    if (isDatabricksMcpUrl(serverUrl)) {
+      const serverInfo = await discoverMcpOAuthServerInfo(serverUrl, fetchFn);
+      return serverInfo.resourceMetadata;
+    }
+    return await discoverOAuthProtectedResourceMetadata(
+      new URL("/", serverUrl),
+      undefined,
+      fetchFn,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function shouldOmitResourceParameter(options: {
+  authorizationServerUrl?: string | URL;
+  tokenEndpoint?: string;
+  authorizationServers?: string[];
+}): boolean {
+  const haystack = [
+    String(options.authorizationServerUrl ?? ""),
+    options.tokenEndpoint ?? "",
+    ...(options.authorizationServers ?? []),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return (
+    haystack.includes("cognito-idp") || haystack.includes("amazoncognito.com")
+  );
+}
 
 /**
  * Discovers OAuth scopes from server metadata, with preference for resource metadata scopes
@@ -21,21 +208,28 @@ import { generateOAuthState } from "../utils/oauthUtils";
 export const discoverScopes = async (
   serverUrl: string,
   resourceMetadata?: OAuthProtectedResourceMetadata,
-  proxyUrl?: string,
+  _proxyUrl?: string,
+  fetchFn?: FetchFn,
 ): Promise<string | undefined> => {
   try {
-    // Always use original server URL for OAuth discovery, not proxy URL
-    const discoveryUrl = new URL("/", serverUrl);
-    const metadata = await discoverAuthorizationServerMetadata(discoveryUrl);
+    if (isDatabricksMcpUrl(serverUrl)) {
+      return "all-apis";
+    }
 
-    // Prefer resource metadata scopes, but fall back to OAuth metadata if empty
-    const resourceScopes = resourceMetadata?.scopes_supported;
-    const oauthScopes = metadata?.scopes_supported;
+    // Prefer resource metadata scopes
+    let scopesSupported = resourceMetadata?.scopes_supported;
 
-    const scopesSupported =
-      resourceScopes && resourceScopes.length > 0
-        ? resourceScopes
-        : oauthScopes;
+    // Resolve authorization server via RFC 9728 (not the MCP host — Cognito lives elsewhere)
+    if (!scopesSupported?.length) {
+      try {
+        const serverInfo = await discoverMcpOAuthServerInfo(serverUrl, fetchFn);
+        if (serverInfo.authorizationServerMetadata?.scopes_supported?.length) {
+          scopesSupported = serverInfo.authorizationServerMetadata.scopes_supported;
+        }
+      } catch {
+        // optional
+      }
+    }
 
     // Be more conservative with scope requests
     if (scopesSupported && scopesSupported.length > 0) {
@@ -147,28 +341,85 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
       return undefined;
     }
 
+    // Cognito does not support RFC 8707 resource indicators on authorize/token — sending
+    // `resource` causes invalid_grant. DCR may point authorization_servers at API Gateway,
+    // while token_endpoint still uses *.amazoncognito.com.
+    try {
+      const serverInfo = await discoverMcpOAuthServerInfo(this.serverUrl);
+      if (
+        shouldOmitResourceParameter({
+          authorizationServerUrl: serverInfo.authorizationServerUrl,
+          tokenEndpoint: serverInfo.authorizationServerMetadata?.token_endpoint,
+          authorizationServers: serverInfo.resourceMetadata?.authorization_servers,
+        })
+      ) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+
     const configuredUrl = new URL(configuredResource);
     const defaultUrl = defaultResource;
-    
-    // If the default resource (expected) is a proxy URL and configured resource is our original server, allow it
-    if (this.proxyUrl && defaultUrl.href === this.proxyUrl && configuredResource === this.serverUrl) {
-      return defaultUrl; // Return the proxy URL
+
+    const isProxyOf = (url: URL, originalUrl: string): boolean =>
+      url.href.includes('/api/mcp-proxy/') &&
+      url.href.includes(encodeURIComponent(originalUrl));
+
+    // Case 1: defaultResource is the proxy URL, configuredResource is the original server URL
+    if (isProxyOf(defaultUrl, configuredResource) || isProxyOf(defaultUrl, this.serverUrl)) {
+      return defaultUrl;
     }
-    
-    // If the default resource contains our proxy pattern and configured resource is our server, allow it
-    if (defaultUrl.href.includes('/api/mcp-proxy/') && 
-        defaultUrl.href.includes(encodeURIComponent(this.serverUrl)) &&
-        configuredResource === this.serverUrl) {
-      return defaultUrl; // Return the proxy URL
+
+    // Case 2: metadata still has proxy URL (legacy) — bind tokens to the real MCP resource
+    if (isProxyOf(configuredUrl, defaultUrl.href) || isProxyOf(configuredUrl, this.serverUrl)) {
+      return new URL(this.serverUrl);
     }
-    
-    // Default validation: check if origins match
+
+    // Case 3: origins match
     if (defaultUrl.origin === configuredUrl.origin) {
       return configuredUrl;
     }
-    
-    // If validation fails, throw the same error as the SDK would
+
     throw new Error(`Protected resource ${configuredResource} does not match expected ${defaultUrl.href} (or origin)`);
+  }
+
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    const key = getServerSpecificKey(SESSION_KEYS.DISCOVERY_STATE, this.serverUrl);
+    const value = sessionStorage.getItem(key);
+    if (!value) {
+      return undefined;
+    }
+    return JSON.parse(value) as OAuthDiscoveryState;
+  }
+
+  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    const key = getServerSpecificKey(SESSION_KEYS.DISCOVERY_STATE, this.serverUrl);
+    sessionStorage.setItem(key, JSON.stringify(state));
+  }
+
+  async invalidateCredentials(
+    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+  ): Promise<void> {
+    if (scope === "all" || scope === "discovery") {
+      sessionStorage.removeItem(
+        getServerSpecificKey(SESSION_KEYS.DISCOVERY_STATE, this.serverUrl),
+      );
+    }
+    if (scope === "all" || scope === "client") {
+      clearClientInformationFromSessionStorage({
+        serverUrl: this.serverUrl,
+        isPreregistered: false,
+      });
+    }
+    if (scope === "all" || scope === "tokens" || scope === "verifier") {
+      sessionStorage.removeItem(
+        getServerSpecificKey(SESSION_KEYS.TOKENS, this.serverUrl),
+      );
+      sessionStorage.removeItem(
+        getServerSpecificKey(SESSION_KEYS.CODE_VERIFIER, this.serverUrl),
+      );
+    }
   }
 
   get redirectUrl() {
@@ -291,92 +542,137 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
       throw new Error("Authorization URL must be HTTP or HTTPS");
     }
 
-    // Use a new tab instead of popup to avoid popup blockers
-    // Store the current window reference for communication
-    const originalWindow = window;
-    
-    // Open OAuth flow in a new tab
+    // Popup keeps window.opener more reliably than _blank after Cognito redirects.
     const authTab = window.open(
       authorizationUrl.href,
-      '_blank'
+      "mcp_oauth",
+      "popup,width=520,height=720,noopener=no,noreferrer=no",
     );
 
     if (!authTab) {
-      throw new Error("Failed to open OAuth tab. Please allow popups/new tabs for this site.");
+      throw new Error(
+        "Failed to open OAuth window. Allow popups for this site and try again.",
+      );
     }
 
-    // Wait for the tab to complete the OAuth flow
+    // Wait for the popup to complete the OAuth flow
     return new Promise((resolve, reject) => {
-      // Listen for messages from the OAuth tab
-      const messageListener = (event: MessageEvent) => {
-        console.log("Parent window received message:", event);
-        console.log("Message origin:", event.origin);
-        console.log("Expected origin:", window.location.origin);
-        console.log("Message data:", event.data);
-        
-        if (event.origin !== window.location.origin) {
-          console.log("Ignoring message from different origin");
-          return; // Ignore messages from other origins
-        }
+      let settled = false;
+      let pollInterval: ReturnType<typeof setInterval> | undefined;
+      let popupClosedAt: number | null = null;
+      const oauthChannel =
+        typeof BroadcastChannel !== "undefined"
+          ? new BroadcastChannel(OAUTH_CALLBACK_CHANNEL)
+          : null;
 
-        if (event.data.type === 'oauth_success') {
-          console.log("Received OAuth success message");
-          // Store the authorization code in the parent window's sessionStorage
-          sessionStorage.setItem("oauth_authorization_code", event.data.code);
-          if (event.data.state) {
-            sessionStorage.setItem("oauth_state", event.data.state);
-          }
-          
-          window.removeEventListener('message', messageListener);
-          console.log("OAuth flow completed successfully");
-          
-          // Immediately attempt token exchange
-          this.exchangeAuthorizationCodeForTokens(event.data.code)
-            .then(() => resolve())
-            .catch((error) => {
-              console.error("Token exchange failed:", error);
-              resolve(); // Still resolve to allow retry logic to handle it
-            });
-        } else if (event.data.type === 'oauth_error') {
-          console.log("Received OAuth error message:", event.data.error);
-          window.removeEventListener('message', messageListener);
-          reject(new Error(event.data.error || "OAuth authentication failed"));
+      const cleanup = () => {
+        window.removeEventListener("message", messageListener);
+        window.removeEventListener("storage", storageListener);
+        oauthChannel?.close();
+        if (pollInterval) {
+          clearInterval(pollInterval);
         }
       };
 
-      window.addEventListener('message', messageListener);
+      const readPendingAuthCode = (): string | null =>
+        sessionStorage.getItem("oauth_authorization_code");
 
-      // Check periodically if the tab is closed manually
-      const checkClosed = setInterval(() => {
-        if (authTab.closed) {
-          clearInterval(checkClosed);
-          window.removeEventListener('message', messageListener);
-          
-          // Check if we received the authorization code via postMessage
-          const authCode = sessionStorage.getItem("oauth_authorization_code");
-          if (authCode) {
-            // Attempt token exchange for manually closed tab
-            this.exchangeAuthorizationCodeForTokens(authCode)
-              .then(() => resolve())
-              .catch((error) => {
-                console.error("Token exchange failed:", error);
-                resolve(); // Still resolve to allow retry logic to handle it
-              });
-          } else {
-            reject(new Error("OAuth flow was cancelled or failed"));
-          }
+      const finishWithCode = (code: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+
+        sessionStorage.setItem("oauth_authorization_code", code);
+        this.exchangeAuthorizationCodeForTokens(code)
+          .then(() => resolve())
+          .catch((error) => {
+            console.error("Token exchange failed:", error);
+            reject(error);
+          });
+      };
+
+      const handleOAuthSuccess = (code: string) => {
+        console.log("Received OAuth authorization code");
+        try {
+          window.focus();
+        } catch {
+          /* ignore */
         }
-      }, 1000);
+        finishWithCode(code);
+      };
+
+      const handleOAuthFailure = (message: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error(message));
+      };
+
+      // postMessage from /oauth/callback (popup or tab with window.opener)
+      const messageListener = (event: MessageEvent) => {
+        if (event.origin !== window.location.origin) {
+          return;
+        }
+
+        if (event.data.type === "oauth_success" && event.data.code) {
+          handleOAuthSuccess(event.data.code);
+        } else if (event.data.type === "oauth_error") {
+          handleOAuthFailure(event.data.error || "OAuth authentication failed");
+        }
+      };
+
+      window.addEventListener("message", messageListener);
+
+      // Callback writes code to sessionStorage before BroadcastChannel; storage event is reliable
+      const storageListener = (event: StorageEvent) => {
+        if (event.key !== "oauth_authorization_code" || !event.newValue || settled) {
+          return;
+        }
+        handleOAuthSuccess(event.newValue);
+      };
+      window.addEventListener("storage", storageListener);
+
+      // BroadcastChannel fallback when callback popup has no window.opener
+      oauthChannel?.addEventListener("message", (event: MessageEvent) => {
+        if (event.data?.type === "oauth_success" && event.data.code) {
+          handleOAuthSuccess(event.data.code);
+        } else if (event.data?.type === "oauth_error") {
+          handleOAuthFailure(event.data.error || "OAuth authentication failed");
+        }
+      });
+
+      // Poll for code (popup may report closed briefly during Cognito redirects)
+      pollInterval = setInterval(() => {
+        if (settled) return;
+
+        const authCode = readPendingAuthCode();
+        if (authCode) {
+          finishWithCode(authCode);
+          return;
+        }
+
+        if (authTab.closed) {
+          if (!popupClosedAt) {
+            popupClosedAt = Date.now();
+          }
+          // Wait for callback page to finish writing the code before failing
+          if (Date.now() - popupClosedAt > 20_000) {
+            handleOAuthFailure(
+              "OAuth flow was cancelled or timed out. Close the OAuth popup after you see success, or click Connect again.",
+            );
+          }
+        } else {
+          popupClosedAt = null;
+        }
+      }, 400);
 
       // Timeout after 10 minutes (longer than popup since users might take more time in a tab)
       setTimeout(() => {
-        clearInterval(checkClosed);
-        window.removeEventListener('message', messageListener);
+        if (settled) return;
         if (!authTab.closed) {
-          // Don't force close the tab, just stop listening
           console.log("OAuth flow timed out, but leaving tab open for user");
         }
-        reject(new Error("OAuth flow timed out"));
+        handleOAuthFailure("OAuth flow timed out");
       }, 10 * 60 * 1000);
     });
   }
@@ -384,108 +680,82 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
   async exchangeAuthorizationCodeForTokens(authorizationCode: string): Promise<void> {
     try {
       console.log("🔄 Starting token exchange...");
-      
-      // Get the authorization server metadata
-      const protectedResourceMetadata = await discoverOAuthProtectedResourceMetadata(this.serverUrl);
-      if (!protectedResourceMetadata.authorization_servers?.[0]) {
-        throw new Error("No authorization server found");
-      }
 
-      const authServerUrl = protectedResourceMetadata.authorization_servers[0];
-      const authServerMetadata = await discoverAuthorizationServerMetadata(authServerUrl);
-      
-      if (!authServerMetadata || !authServerMetadata.token_endpoint) {
+      const cachedDiscovery = await this.discoveryState();
+      const serverInfo = cachedDiscovery?.authorizationServerMetadata
+        ? {
+            authorizationServerUrl: cachedDiscovery.authorizationServerUrl,
+            authorizationServerMetadata:
+              cachedDiscovery.authorizationServerMetadata,
+          }
+        : await discoverMcpOAuthServerInfo(
+            this.serverUrl,
+            isDatabricksMcpUrl(this.serverUrl)
+              ? createDatabricksOAuthFetch()
+              : undefined,
+          );
+      const authServerMetadata = serverInfo.authorizationServerMetadata;
+
+      if (!authServerMetadata?.token_endpoint) {
         throw new Error("No token endpoint found");
       }
 
-      // Prepare token exchange request
-      const codeVerifier = this.codeVerifier();
-      if (!codeVerifier) {
-        throw new Error("No code verifier found");
-      }
-
-      // Get client information if available
       const clientInfo = await this.clientInformation();
-      
-      // Prepare token exchange request - completely manual to avoid code_verifier encoding
-      const formParts: string[] = [
-        `grant_type=${encodeURIComponent('authorization_code')}`,
-        `code=${encodeURIComponent(authorizationCode)}`,
-        `redirect_uri=${encodeURIComponent(this.redirectUrl)}`,
-      ];
-
-      // Add client_id if we have client information
-      if (clientInfo?.client_id) {
-        formParts.push(`client_id=${encodeURIComponent(clientInfo.client_id)}`);
+      if (!clientInfo?.client_id) {
+        throw new Error("No OAuth client_id available — try clearing site data and reconnecting");
       }
 
-      // Add client_secret for pre-registered clients
-      if ((clientInfo as any)?.client_secret) {
-        formParts.push(`client_secret=${encodeURIComponent((clientInfo as any).client_secret)}`);
-      }
+      const codeVerifier = this.codeVerifier();
 
-      // Add code_verifier WITHOUT encoding - this is critical for AWS Cognito
-      formParts.push(`code_verifier=${codeVerifier}`);
+      // Must match the `resource` sent during authorization (RFC 8707 / MCP OAuth)
+      let resource = await selectResourceURL(
+        this.serverUrl,
+        this,
+        serverInfo.resourceMetadata,
+      );
 
-      const formBody = formParts.join('&');
-
-      console.log("🔄 Token exchange request:", {
-        endpoint: authServerMetadata.token_endpoint,
-        grant_type: 'authorization_code',
-        redirect_uri: this.redirectUrl,
-        code_length: authorizationCode.length,
-        code_verifier_length: codeVerifier.length,
-        code_verifier_preview: `${codeVerifier.substring(0, 10)}...`,
-        client_id: clientInfo?.client_id || 'none',
-        has_client_secret: !!(clientInfo as any)?.client_secret,
-        auth_method: (clientInfo as any)?.token_endpoint_auth_method || 'none',
+      const omitResource = shouldOmitResourceParameter({
+        authorizationServerUrl: serverInfo.authorizationServerUrl,
+        tokenEndpoint: authServerMetadata.token_endpoint,
+        authorizationServers: serverInfo.resourceMetadata?.authorization_servers,
       });
+      if (omitResource) {
+        resource = undefined;
+        console.log("Omitting OAuth resource parameter (Cognito does not support RFC 8707)");
+      }
 
-      // Make token exchange request directly to OAuth server (not through MCP proxy)
-      const tokenEndpoint = authServerMetadata.token_endpoint;
-      
-      // OAuth token exchange must go directly to the OAuth server, not through any proxy
-      const requestUrl = tokenEndpoint;
+      console.log(
+        "🔄 Token exchange request:",
+        JSON.stringify({
+          endpoint: authServerMetadata.token_endpoint,
+          redirect_uri: this.redirectUrl,
+          resource: resource?.href ?? "(omitted for Cognito)",
+          client_id: clientInfo.client_id,
+          has_client_secret: !!(clientInfo as { client_secret?: string }).client_secret,
+        }),
+      );
 
-      const response = await fetch(requestUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Accept': 'application/json',
+      const tokens = await exchangeAuthorization(
+        serverInfo.authorizationServerUrl,
+        {
+          metadata: authServerMetadata,
+          clientInformation: clientInfo,
+          authorizationCode,
+          codeVerifier,
+          redirectUri: this.redirectUrl,
+          resource,
         },
-        body: formBody,
-      });
+      );
 
-      console.log("🔄 Token exchange response:", {
-        status: response.status,
-        statusText: response.statusText,
-        contentType: response.headers.get('content-type'),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("Token exchange failed:", errorText);
-        console.error("Request details:", {
-          url: requestUrl,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json',
-          },
-          body: formBody,
-        });
-        throw new Error(`Token exchange failed: ${response.status} ${response.statusText}`);
-      }
-
-      const tokens = await response.json();
       console.log("🔄 Received tokens:", {
-        access_token: tokens.access_token ? `${tokens.access_token.substring(0, 20)}...` : 'missing',
+        access_token: tokens.access_token
+          ? `${tokens.access_token.substring(0, 20)}...`
+          : "missing",
         token_type: tokens.token_type,
         expires_in: tokens.expires_in,
-        refresh_token: tokens.refresh_token ? 'present' : 'missing',
+        refresh_token: tokens.refresh_token ? "present" : "missing",
       });
 
-      // Save tokens
       this.saveTokens(tokens);
       
       // Clear authorization code and code verifier
@@ -496,13 +766,24 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
       
       console.log("✅ Token exchange completed successfully");
     } catch (error) {
-      console.error("❌ Token exchange failed:", error);
-      
-      // Only clear authorization code on failure, keep code verifier for potential retries
+      const detail = formatOAuthError(error);
+      console.error("❌ Token exchange failed:", detail, error);
+
       sessionStorage.removeItem("oauth_authorization_code");
       sessionStorage.removeItem("oauth_state");
-      
-      throw error;
+
+      // Stale DCR client (wrong redirect_uri) often surfaces as invalid_grant
+      if (detail.includes("invalid_grant") || detail.includes("invalid_client")) {
+        clearClientInformationFromSessionStorage({
+          serverUrl: this.serverUrl,
+          isPreregistered: false,
+        });
+        sessionStorage.removeItem(
+          getServerSpecificKey("playground_client_info", this.serverUrl),
+        );
+      }
+
+      throw error instanceof Error ? error : new Error(detail);
     }
   }
 
@@ -528,19 +809,32 @@ export class PlaygroundOAuthClientProvider implements OAuthClientProvider {
   }
 
   clear() {
-    clearClientInformationFromSessionStorage({
-      serverUrl: this.serverUrl,
-      isPreregistered: false,
-    });
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.TOKENS, this.serverUrl),
-    );
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.CODE_VERIFIER, this.serverUrl),
-    );
+    void this.invalidateCredentials("all");
     // Clear playground client information
     sessionStorage.removeItem(
       getServerSpecificKey("playground_client_info", this.serverUrl),
     );
   }
+}
+
+/** Pre-seed SDK auth() so it skips broken discovery on the external MCP path. */
+export async function seedDatabricksOAuthDiscovery(
+  provider: PlaygroundOAuthClientProvider,
+  serverUrl: string,
+  fetchFn?: FetchFn,
+  serverInfo?: McpOAuthServerInfo,
+): Promise<void> {
+  const resolved =
+    serverInfo ?? (await discoverMcpOAuthServerInfo(serverUrl, fetchFn));
+  if (!resolved.authorizationServerMetadata?.authorization_endpoint) {
+    throw new Error(
+      "Could not discover Databricks OAuth authorization endpoint. Check the External MCP URL.",
+    );
+  }
+  await provider.saveDiscoveryState({
+    authorizationServerUrl: String(resolved.authorizationServerUrl),
+    resourceMetadataUrl: getDatabricksProtectedResourceMetadataUrl(serverUrl).href,
+    resourceMetadata: resolved.resourceMetadata,
+    authorizationServerMetadata: resolved.authorizationServerMetadata,
+  });
 }

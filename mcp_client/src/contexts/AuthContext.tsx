@@ -120,11 +120,6 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
           console.log('✅ setError(null) called');
 
           console.log('✅ All state setters called - waiting for re-render...');
-          
-          // Force a re-render check
-          setTimeout(() => {
-            console.log('🔍 State check after timeout - isAuthenticated:', isAuthenticated, 'user:', user?.username);
-          }, 100);
 
           resolve(newUser);
         },

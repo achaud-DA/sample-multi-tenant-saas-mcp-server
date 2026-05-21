@@ -5,6 +5,10 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { authenticateToken, optionalAuth } from "./auth-middleware.js";
 import { createInferenceHandler, type InferenceParams } from "../shared/inference-handler.js";
 import { handleMcpProxy } from "../shared/mcp-proxy.js";
+import {
+  extractOAuthDiscoveryTargetFromPath,
+  handleOAuthDiscoveryProxy,
+} from "../shared/oauth-discovery-proxy.js";
 import { setCorsHeaders } from "../shared/cors-config.js";
 import { createHealthCheckResponse } from "../shared/response-utils.js";
 import { getAuthConfig } from "../shared/auth-handlers.js";
@@ -179,6 +183,36 @@ app.post("/api/inference", optionalAuth, async (req: any, res) => {
 			details: error instanceof Error ? error.message : "Unknown error"
 		});
 	}
+});
+
+// Databricks OAuth metadata proxy (path-encoded target, same as mcp-proxy)
+app.get(/^\/api\/oauth-discovery\/(.+)$/, async (req, res) => {
+	try {
+		const target =
+			extractOAuthDiscoveryTargetFromPath(req.path) ??
+			(typeof req.query.target === "string" ? req.query.target : null);
+		if (!target) {
+			res.status(400).json({ error: "OAuth discovery target URL is required in path" });
+			return;
+		}
+
+		const proxyResponse = await handleOAuthDiscoveryProxy(target);
+		Object.entries(proxyResponse.headers).forEach(([key, value]) => {
+			res.setHeader(key, value);
+		});
+		res.status(proxyResponse.statusCode).send(proxyResponse.body);
+	} catch (error) {
+		console.error("OAuth discovery proxy error:", error);
+		res.status(500).json({
+			error: "OAuth discovery proxy error",
+			details: error instanceof Error ? error.message : "Unknown error",
+		});
+	}
+});
+
+app.options(/^\/api\/oauth-discovery(\/.*)?$/, (req, res) => {
+	setCorsHeaders((key, value) => res.setHeader(key, value));
+	res.status(200).end();
 });
 
 // MCP Proxy endpoint with OAuth discovery support

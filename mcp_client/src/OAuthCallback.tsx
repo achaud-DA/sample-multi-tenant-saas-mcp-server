@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { OAUTH_CALLBACK_CHANNEL } from "./lib/constants";
 
 export default function OAuthCallback() {
   const [status, setStatus] = useState<"processing" | "success" | "error">("processing");
@@ -67,6 +68,14 @@ export default function OAuthCallback() {
           return;
         }
 
+        // React Strict Mode runs effects twice — only deliver each code once
+        const dedupeKey = `oauth_callback_delivered_${code}`;
+        if (sessionStorage.getItem(dedupeKey)) {
+          console.log("OAuth callback already delivered for this code, skipping");
+          return;
+        }
+        sessionStorage.setItem(dedupeKey, "1");
+
         // Store the authorization code for the MCP client to pick up
         sessionStorage.setItem("oauth_authorization_code", code);
         if (state) {
@@ -74,34 +83,38 @@ export default function OAuthCallback() {
         }
 
         setStatus("success");
-        setMessage("Authorization successful! Closing window...");
 
-        // Send the authorization code to the parent window
-        if (window.opener && !window.opener.closed) {
+        const payload = { type: "oauth_success" as const, code, state };
+        const hasOpener = !!(window.opener && !window.opener.closed);
+
+        if (hasOpener) {
+          setMessage("Authorization successful! Returning to the playground...");
           console.log("Sending postMessage to parent window");
           try {
-            window.opener.postMessage({
-              type: 'oauth_success',
-              code: code,
-              state: state
-            }, window.location.origin);
-            console.log("PostMessage sent successfully");
+            window.opener.postMessage(payload, window.location.origin);
+            window.opener.focus();
           } catch (err) {
             console.error("Failed to send postMessage:", err);
           }
-          
-          // Close the popup after sending the message
-          setTimeout(() => {
-            console.log("Closing popup window");
-            window.close();
-          }, 1000);
         } else {
-          console.log("No opener window found or opener is closed, using fallback redirect");
-          // Fallback: redirect back to main app
-          setTimeout(() => {
-            navigate("/");
-          }, 1500);
+          setMessage(
+            "Authorization successful! Close this tab and return to your MCP Playground tab to finish connecting.",
+          );
+          try {
+            const channel = new BroadcastChannel(OAUTH_CALLBACK_CHANNEL);
+            channel.postMessage(payload);
+            channel.close();
+          } catch (err) {
+            console.warn("BroadcastChannel unavailable:", err);
+          }
         }
+
+        setTimeout(() => {
+          // Do not navigate to / — that opens a second playground and forces demo login again.
+          if (hasOpener) {
+            window.close();
+          }
+        }, 1500);
 
       } catch (error) {
         console.error("OAuth callback error:", error);
@@ -141,7 +154,7 @@ export default function OAuthCallback() {
           
           {status === "success" && (
             <p className="text-sm text-gray-500 mt-4">
-              Redirecting back to the application...
+              You can close this window — the playground tab will finish connecting automatically.
             </p>
           )}
           

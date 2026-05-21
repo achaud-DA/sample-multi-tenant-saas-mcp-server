@@ -28,6 +28,10 @@ const stack = new McpPlaygroundStack(app, 'McpPlaygroundStack', {
   zoneName,
 });
 
+// Apply resource tags to all resources in the stack
+cdk.Tags.of(app).add('map-migrated', 'd-server-028bqm2pgp95c2');
+cdk.Tags.of(app).add('createdBy', 'anantc');
+
 // Add CDK Nag security checks
 Aspects.of(app).add(new AwsSolutionsChecks({ verbose: true }));
 

@@ -329,6 +329,9 @@ export class McpPlaygroundStack extends cdk.Stack {
           'X-Amz-Security-Token',
           'X-Amz-User-Agent',
           'x-custom-auth-header',
+          'mcp-session-id',
+          'mcp-protocol-version',
+          'last-event-id',
         ],
       },
     });
@@ -349,6 +352,11 @@ export class McpPlaygroundStack extends cdk.Stack {
     const mcpProxyResource = apiResource.addResource('mcp-proxy');
     const mcpProxyAnyResource = mcpProxyResource.addResource('{proxy+}');
     mcpProxyAnyResource.addMethod('ANY', lambdaIntegration);
+
+    // Databricks OAuth metadata proxy (path-encoded target; CloudFront does not forward query strings)
+    const oauthDiscoveryResource = apiResource.addResource('oauth-discovery');
+    const oauthDiscoveryTargetResource = oauthDiscoveryResource.addResource('{target+}');
+    oauthDiscoveryTargetResource.addMethod('GET', lambdaIntegration);
 
     // Auth endpoints (if Cognito is enabled)
     if (this.userPool && this.userPoolClient) {
@@ -412,6 +420,21 @@ export class McpPlaygroundStack extends cdk.Stack {
               maxTtl: cdk.Duration.millis(0),
               defaultTtl: cdk.Duration.millis(0),
               minTtl: cdk.Duration.millis(0),
+              // CloudFront does not forward viewer headers by default; Streamable HTTP MCP
+              // needs Authorization + mcp-session-id (and related) to reach API Gateway/Lambda.
+              forwardedValues: {
+                queryString: true,
+                headers: [
+                  'Authorization',
+                  'Content-Type',
+                  'Accept',
+                  'mcp-session-id',
+                  'mcp-protocol-version',
+                  'last-event-id',
+                  'x-custom-auth-header',
+                ],
+                cookies: { forward: 'none' },
+              },
             },
             {
               allowedMethods: cloudfront.CloudFrontAllowedMethods.GET_HEAD,
@@ -434,16 +457,21 @@ export class McpPlaygroundStack extends cdk.Stack {
           ],
         },
       ],
+      // SPA routing: S3 has no object for /oauth/callback — serve index.html on 404/403.
+      // API routes must NOT return 404/403 (use 502 in Lambda/mcp-proxy) or CloudFront will
+      // return HTML for MCP calls too.
       errorConfigurations: [
         {
           errorCode: 404,
           responseCode: 200,
           responsePagePath: '/index.html',
+          errorCachingMinTtl: 0,
         },
         {
           errorCode: 403,
           responseCode: 200,
           responsePagePath: '/index.html',
+          errorCachingMinTtl: 0,
         },
       ],
       ...(props?.domainName && certificate ? {

@@ -1,6 +1,10 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { createInferenceHandler, type InferenceParams } from '../../src/shared/inference-handler';
 import { handleMcpProxy } from '../../src/shared/mcp-proxy';
+import {
+  extractOAuthDiscoveryTargetFromPath,
+  handleOAuthDiscoveryProxy,
+} from '../../src/shared/oauth-discovery-proxy';
 import { corsHeaders } from '../../src/shared/cors-config';
 import { createLambdaResponse, createHealthCheckResponse, createErrorResponse } from '../../src/shared/response-utils';
 import { getAuthConfig, createUserPlaceholderResponse, createValidatePlaceholderResponse } from '../../src/shared/auth-handlers';
@@ -21,7 +25,8 @@ export const handler = async (
   }
 
   try {
-    const path = event.path;
+    // API Gateway may include stage prefix (e.g. /prod/api/...); normalize to route path
+    const path = event.path.replace(/^\/[^/]+(?=\/api\/)/, "") || event.path;
     const method = event.httpMethod;
 
     // Health check endpoint
@@ -47,13 +52,29 @@ export const handler = async (
       return await handleInference(event);
     }
 
+    // OAuth discovery proxy (Databricks metadata; target is path-encoded like mcp-proxy)
+    if (path.startsWith('/api/oauth-discovery/') && method === 'GET') {
+      const target =
+        extractOAuthDiscoveryTargetFromPath(path) ??
+        event.queryStringParameters?.target;
+      if (!target) {
+        return createLambdaResponse(400, createErrorResponse('OAuth discovery target URL is required in path'));
+      }
+      const proxyResponse = await handleOAuthDiscoveryProxy(target);
+      return {
+        statusCode: proxyResponse.statusCode,
+        headers: { ...corsHeaders, ...proxyResponse.headers },
+        body: proxyResponse.body,
+      };
+    }
+
     // MCP Proxy endpoint
     if (path.startsWith('/api/mcp-proxy/')) {
       return await handleMcpProxyLambda(event);
     }
 
-    // Route not found
-    return createLambdaResponse(404, createErrorResponse('Route not found'));
+    // Use 502 (not 404) so CloudFront SPA custom-error rules do not replace JSON with index.html
+    return createLambdaResponse(502, createErrorResponse('Route not found', path));
   } catch (error) {
     console.error('Handler error:', error);
     return createLambdaResponse(500, createErrorResponse(
@@ -143,12 +164,21 @@ async function handleInference(event: APIGatewayProxyEvent): Promise<APIGatewayP
   }
 }
 
+function buildMcpProxyPath(event: APIGatewayProxyEvent): string {
+  const normalized = event.path.replace(/^\/[^/]+(?=\/api\/)/, '') || event.path;
+  const proxySegment = event.pathParameters?.proxy;
+  if (proxySegment) {
+    return `/api/mcp-proxy/${proxySegment}`;
+  }
+  return normalized;
+}
+
 async function handleMcpProxyLambda(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   return await handleMcpProxy({
     method: event.httpMethod,
-    url: event.path,
+    url: buildMcpProxyPath(event),
     headers: event.headers,
     body: event.body,
-    queryStringParameters: event.queryStringParameters
+    queryStringParameters: event.queryStringParameters,
   });
 }

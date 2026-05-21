@@ -1,0 +1,24 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.createValidatePlaceholderResponse = exports.createUserPlaceholderResponse = exports.getAuthConfig = void 0;
+function getAuthConfig() {
+    return {
+        userPoolId: process.env.COGNITO_USER_POOL_ID,
+        clientId: process.env.COGNITO_CLIENT_ID,
+        region: process.env.COGNITO_REGION || process.env.AWS_REGION || 'us-east-1',
+    };
+}
+exports.getAuthConfig = getAuthConfig;
+function createUserPlaceholderResponse() {
+    return {
+        message: 'User endpoint - JWT validation not implemented yet',
+    };
+}
+exports.createUserPlaceholderResponse = createUserPlaceholderResponse;
+function createValidatePlaceholderResponse() {
+    return {
+        message: 'Validate endpoint - JWT validation not implemented yet',
+    };
+}
+exports.createValidatePlaceholderResponse = createValidatePlaceholderResponse;
+//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiYXV0aC1oYW5kbGVycy5qcyIsInNvdXJjZVJvb3QiOiIiLCJzb3VyY2VzIjpbImF1dGgtaGFuZGxlcnMudHMiXSwibmFtZXMiOltdLCJtYXBwaW5ncyI6Ijs7O0FBTUEsU0FBZ0IsYUFBYTtJQUMzQixPQUFPO1FBQ0wsVUFBVSxFQUFFLE9BQU8sQ0FBQyxHQUFHLENBQUMsb0JBQW9CO1FBQzVDLFFBQVEsRUFBRSxPQUFPLENBQUMsR0FBRyxDQUFDLGlCQUFpQjtRQUN2QyxNQUFNLEVBQUUsT0FBTyxDQUFDLEdBQUcsQ0FBQyxjQUFjLElBQUksT0FBTyxDQUFDLEdBQUcsQ0FBQyxVQUFVLElBQUksV0FBVztLQUM1RSxDQUFDO0FBQ0osQ0FBQztBQU5ELHNDQU1DO0FBTUQsU0FBZ0IsNkJBQTZCO0lBQzNDLE9BQU87UUFDTCxPQUFPLEVBQUUsb0RBQW9EO0tBQzlELENBQUM7QUFDSixDQUFDO0FBSkQsc0VBSUM7QUFFRCxTQUFnQixpQ0FBaUM7SUFDL0MsT0FBTztRQUNMLE9BQU8sRUFBRSx3REFBd0Q7S0FDbEUsQ0FBQztBQUNKLENBQUM7QUFKRCw4RUFJQyIsInNvdXJjZXNDb250ZW50IjpbImV4cG9ydCBpbnRlcmZhY2UgQXV0aENvbmZpZyB7XG4gIHVzZXJQb29sSWQ/OiBzdHJpbmc7XG4gIGNsaWVudElkPzogc3RyaW5nO1xuICByZWdpb24/OiBzdHJpbmc7XG59XG5cbmV4cG9ydCBmdW5jdGlvbiBnZXRBdXRoQ29uZmlnKCk6IEF1dGhDb25maWcge1xuICByZXR1cm4ge1xuICAgIHVzZXJQb29sSWQ6IHByb2Nlc3MuZW52LkNPR05JVE9fVVNFUl9QT09MX0lELFxuICAgIGNsaWVudElkOiBwcm9jZXNzLmVudi5DT0dOSVRPX0NMSUVOVF9JRCxcbiAgICByZWdpb246IHByb2Nlc3MuZW52LkNPR05JVE9fUkVHSU9OIHx8IHByb2Nlc3MuZW52LkFXU19SRUdJT04gfHwgJ3VzLWVhc3QtMScsXG4gIH07XG59XG5cbmV4cG9ydCBpbnRlcmZhY2UgUGxhY2Vob2xkZXJSZXNwb25zZSB7XG4gIG1lc3NhZ2U6IHN0cmluZztcbn1cblxuZXhwb3J0IGZ1bmN0aW9uIGNyZWF0ZVVzZXJQbGFjZWhvbGRlclJlc3BvbnNlKCk6IFBsYWNlaG9sZGVyUmVzcG9uc2Uge1xuICByZXR1cm4ge1xuICAgIG1lc3NhZ2U6ICdVc2VyIGVuZHBvaW50IC0gSldUIHZhbGlkYXRpb24gbm90IGltcGxlbWVudGVkIHlldCcsXG4gIH07XG59XG5cbmV4cG9ydCBmdW5jdGlvbiBjcmVhdGVWYWxpZGF0ZVBsYWNlaG9sZGVyUmVzcG9uc2UoKTogUGxhY2Vob2xkZXJSZXNwb25zZSB7XG4gIHJldHVybiB7XG4gICAgbWVzc2FnZTogJ1ZhbGlkYXRlIGVuZHBvaW50IC0gSldUIHZhbGlkYXRpb24gbm90IGltcGxlbWVudGVkIHlldCcsXG4gIH07XG59XG4iXX0=

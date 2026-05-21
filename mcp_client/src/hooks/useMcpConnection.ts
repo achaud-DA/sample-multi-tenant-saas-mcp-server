@@ -20,15 +20,24 @@ import {
   Resource,
   Prompt,
 } from "@modelcontextprotocol/sdk/types.js";
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import {
-  auth,
-  discoverOAuthProtectedResourceMetadata,
-} from "@modelcontextprotocol/sdk/client/auth.js";
-import { PlaygroundOAuthClientProvider, discoverScopes } from "../lib/auth";
-import { ConnectionStatus } from "../lib/constants";
+  discoverMcpOAuthServerInfo,
+  PlaygroundOAuthClientProvider,
+  discoverScopes,
+  seedDatabricksOAuthDiscovery,
+  type McpOAuthServerInfo,
+} from "../lib/auth";
+import { ConnectionStatus, SESSION_KEYS } from "../lib/constants";
 import { z } from "zod";
 import { McpConnectionState, EMPTY_MCP_CONNECTION_STATE } from "../lib/auth-types";
-import { getMcpProxyUrl, getApiBaseUrl } from "../lib/config";
+import {
+  createDatabricksOAuthFetch,
+  getDatabricksProtectedResourceMetadataUrl,
+  getMcpProxyUrl,
+  getOAuthDiscoveryUrl,
+  isDatabricksMcpUrl,
+} from "../lib/config";
 
 interface UseMcpConnectionOptions {
   serverUrl?: string;
@@ -63,26 +72,46 @@ export function useMcpConnection({
     onError?.(error);
   }, [onError, updateState]);
 
-  const is401Error = (error: unknown): boolean => {
+  const isAuthRequiredError = (error: unknown): boolean => {
+    if (!(error instanceof Error)) return false;
+    const msg = error.message.toLowerCase();
     return (
-      (error instanceof Error && error.message.includes("401")) ||
-      (error instanceof Error && error.message.includes("Unauthorized")) ||
-      (error instanceof Error && error.message.includes("Authentication failed"))
+      msg.includes("401") ||
+      msg.includes("unauthorized") ||
+      msg.includes("authentication failed") ||
+      msg.includes("invalid_token") ||
+      msg.includes("missing authorization") ||
+      msg.includes("www-authenticate")
     );
   };
 
-  const handleAuthError = async (error: unknown, url: string, retryWithoutScope: boolean = false) => {
-    if (is401Error(error)) {
+  const handleAuthError = async (
+    error: unknown,
+    url: string,
+    retryWithoutScope: boolean = false,
+    connectRetryCount: number = 0,
+  ) => {
+    if (isAuthRequiredError(error)) {
       // If we have a manual bearer token, don't try OAuth - just fail fast
       if (bearerToken) {
         console.log("🔍 401 error with manual bearer token - failing immediately");
         return false;
       }
+
+      if (connectRetryCount >= 3) {
+        handleError(
+          new Error(
+            "Authentication failed after multiple attempts. Check the MCP server URL, OAuth redirect URI, and client credentials.",
+          ),
+        );
+        return false;
+      }
       
       updateState({ status: "authenticating" });
+
+      sessionStorage.setItem(SESSION_KEYS.PENDING_CONNECT_URL, url);
+      sessionStorage.setItem(SESSION_KEYS.LAST_SERVER_URL, url);
       
-      // Declare variables at function scope for access in catch blocks
-      let authCode: string | null = null;
       let serverAuthProvider: PlaygroundOAuthClientProvider | null = null;
       
       try {
@@ -90,29 +119,41 @@ export function useMcpConnection({
         
         let scope = undefined;
         const proxyUrl = getMcpProxyUrl(url);
-        
+        const databricksFetch = isDatabricksMcpUrl(url)
+          ? createDatabricksOAuthFetch()
+          : undefined;
+
+        let databricksServerInfo: McpOAuthServerInfo | undefined;
+        if (isDatabricksMcpUrl(url) && databricksFetch) {
+          databricksServerInfo = await discoverMcpOAuthServerInfo(
+            url,
+            databricksFetch,
+          );
+        }
+
         if (!retryWithoutScope) {
-          // First attempt: discover scopes normally using original server URL
-          let resourceMetadata;
-          try {
-            resourceMetadata = await discoverOAuthProtectedResourceMetadata(
-              new URL("/", url), // Use original server URL for OAuth discovery
-            );
-          } catch {
-            // Resource metadata is optional, continue without it
-          }
-          scope = await discoverScopes(url, resourceMetadata, proxyUrl);
+          scope = await discoverScopes(
+            url,
+            databricksServerInfo?.resourceMetadata,
+            proxyUrl,
+            databricksFetch,
+          );
         } else {
           // Retry attempt: try without any scope
           console.log("Retrying OAuth without scope parameter");
           scope = undefined;
         }
+
+        if (!scope && isDatabricksMcpUrl(url)) {
+          scope = "all-apis";
+        }
         
         console.log("Using scope:", scope);
-        
-        // Check sessionStorage before auth
-        authCode = sessionStorage.getItem("oauth_authorization_code");
-        
+
+        // Drop leftover codes from a previous attempt (they cause invalid_grant if reused)
+        sessionStorage.removeItem("oauth_authorization_code");
+        sessionStorage.removeItem("oauth_state");
+
         serverAuthProvider = new PlaygroundOAuthClientProvider(
           url, 
           scope, 
@@ -121,31 +162,32 @@ export function useMcpConnection({
           clientSecret
         );
         
-        // Check if we already have valid tokens from a previous OAuth flow
+        // Tokens exist but we still got 401 — they are stale or for the wrong resource
         const existingTokens = await serverAuthProvider.tokens();
-        
         if (existingTokens?.access_token) {
-          return true; // We have tokens, so consider auth successful
+          console.log("Clearing stale OAuth tokens after 401");
+          serverAuthProvider.clear();
         }
 
-        // If we have an authorization code but no tokens, try to exchange it manually
-        if (authCode && !existingTokens) {
-          try {
-            await serverAuthProvider.exchangeAuthorizationCodeForTokens(authCode);
-            const tokensAfterExchange = await serverAuthProvider.tokens();
-            if (tokensAfterExchange?.access_token) {
-              console.log("✅ Manual token exchange successful");
-              return true;
-            }
-          } catch (exchangeError) {
-            console.error("❌ Manual token exchange failed:", exchangeError);
-          }
+        if (isDatabricksMcpUrl(url) && databricksServerInfo) {
+          await seedDatabricksOAuthDiscovery(
+            serverAuthProvider,
+            url,
+            databricksFetch,
+            databricksServerInfo,
+          );
         }
 
-        const result = await auth(serverAuthProvider, {
-          serverUrl: url,
+        const authOptions: Parameters<typeof auth>[1] = {
+          serverUrl: getOAuthDiscoveryUrl(url),
           scope,
-        });
+          fetchFn: databricksFetch,
+        };
+        if (isDatabricksMcpUrl(url)) {
+          authOptions.resourceMetadataUrl =
+            getDatabricksProtectedResourceMetadataUrl(url);
+        }
+        const result = await auth(serverAuthProvider, authOptions);
         
         console.log("🔍 Auth result:", result);
         console.log("🔍 Auth result === 'AUTHORIZED':", result === "AUTHORIZED");
@@ -155,25 +197,26 @@ export function useMcpConnection({
         const tokens = await serverAuthProvider.tokens();
         console.log("  Tokens available:", !!tokens);
         console.log("  Access token:", tokens?.access_token ? "present" : "missing");
-        
+
+        // SDK returns REDIRECT after browser OAuth even when tokens were saved in redirectToAuthorization
+        if (tokens?.access_token) {
+          return true;
+        }
+
+        if (result === "REDIRECT") {
+          handleError(
+            new Error(
+              "OAuth login completed but token exchange failed. Check browser console and that your OAuth app's redirect URI matches this app exactly.",
+            ),
+          );
+          return false;
+        }
+
         return result === "AUTHORIZED";
       } catch (authError) {
         console.error("OAuth flow failed:", authError);
         
         // If tab is blocked but we have an authorization code, try to continue
-        if (authError instanceof Error && 
-            authError.message.includes("Failed to open OAuth tab") && 
-            authCode && serverAuthProvider) {
-          console.log("🔍 Tab blocked but authorization code exists, attempting to continue...");
-          
-          // Check if tokens were created despite the tab error
-          const tokensAfterError = await serverAuthProvider.tokens();
-          if (tokensAfterError?.access_token) {
-            console.log("🔍 Tokens found after tab error, considering auth successful");
-            return true;
-          }
-        }
-        
         // Clear authorization code if auth failed to prevent confusion
         sessionStorage.removeItem("oauth_authorization_code");
         sessionStorage.removeItem("oauth_state");
@@ -183,7 +226,7 @@ export function useMcpConnection({
             authError instanceof Error && 
             (authError.message.includes("invalid_scope") || authError.message.includes("invalid_request"))) {
           console.log("Got invalid_scope error, retrying without scope");
-          return await handleAuthError(error, url, true);
+          return await handleAuthError(error, url, true, connectRetryCount);
         }
         
         handleError(new Error(`Authentication failed: ${authError instanceof Error ? authError.message : String(authError)}`));
@@ -194,25 +237,46 @@ export function useMcpConnection({
   };
 
   const loadServerData = async (mcpClient: Client) => {
-    try {
-      // Load tools
-      const toolsResponse = await mcpClient.request(
-        { method: "tools/list" },
-        ListToolsResultSchema
-      );
-      
-      // Load resources
-      const resourcesResponse = await mcpClient.request(
-        { method: "resources/list" },
-        ListResourcesResultSchema
-      );
-      
-      // Load prompts
-      const promptsResponse = await mcpClient.request(
-        { method: "prompts/list" },
-        ListPromptsResultSchema
-      );
+    const skipped: string[] = [];
 
+    let toolsResponse = { tools: [] as Tool[] };
+    try {
+      toolsResponse = await mcpClient.request(
+        { method: "tools/list" },
+        ListToolsResultSchema,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn("Failed to load tools:", error);
+      updateState({
+        error: `Connected but tools/list failed: ${detail}`,
+      });
+      return;
+    }
+
+    let resourcesResponse = { resources: [] as Resource[] };
+    try {
+      resourcesResponse = await mcpClient.request(
+        { method: "resources/list" },
+        ListResourcesResultSchema,
+      );
+    } catch (error) {
+      console.warn("resources/list not available:", error);
+      skipped.push("resources");
+    }
+
+    let promptsResponse = { prompts: [] as Prompt[] };
+    try {
+      promptsResponse = await mcpClient.request(
+        { method: "prompts/list" },
+        ListPromptsResultSchema,
+      );
+    } catch (error) {
+      console.warn("prompts/list not available:", error);
+      skipped.push("prompts");
+    }
+
+    try {
       // Attach callTool method to each tool - capture mcpClient in closure
       const toolsWithCallTool = (toolsResponse.tools || []).map((tool: any) => ({
         ...tool,
@@ -279,15 +343,24 @@ export function useMcpConnection({
         tools: toolsWithCallTool,
         resources: resourcesWithReadResource,
         prompts: promptsWithGetPrompt,
+        error:
+          skipped.length > 0
+            ? `Connected (${toolsWithCallTool.length} tools). Optional features unavailable: ${skipped.join(", ")}.`
+            : null,
       });
     } catch (error) {
-      console.warn("Failed to load server data:", error);
-      // Don't treat this as a fatal error
+      console.warn("Failed to process server data:", error);
+      const detail = error instanceof Error ? error.message : String(error);
+      updateState({
+        error: `Connected but failed to process server data: ${detail}`,
+      });
     }
   };
 
   const connect = async (url: string, retryCount: number = 0) => {
     if (!url) return;
+
+    sessionStorage.setItem(SESSION_KEYS.LAST_SERVER_URL, url);
 
     updateState({ 
       status: "connecting", 
@@ -319,14 +392,15 @@ export function useMcpConnection({
       let scope = undefined;
       if (!bearerToken) {
         // Only do OAuth discovery if no manual bearer token is provided
-        try {
-          const resourceMetadata = await discoverOAuthProtectedResourceMetadata(
-            new URL("/", url), // Use original server URL, not proxy URL
-          );
-          scope = await discoverScopes(url, resourceMetadata, proxyUrl);
-        } catch {
-          // Resource metadata is optional, continue without it
-        }
+        const databricksFetch = isDatabricksMcpUrl(url)
+          ? createDatabricksOAuthFetch()
+          : undefined;
+        scope = await discoverScopes(
+          url,
+          undefined,
+          proxyUrl,
+          databricksFetch,
+        );
       }
       
       // Create auth provider with discovered scope (consistent with OAuth flow)
@@ -347,8 +421,22 @@ export function useMcpConnection({
         console.log("  Using manual bearer token");
         console.log("  Token length:", token.length);
       } else {
-        // No manual token - try OAuth
+        // No manual token - use cached OAuth tokens or run the flow before connecting
         token = (await serverAuthProvider.tokens())?.access_token;
+        if (!token) {
+          console.log("No MCP access token in session — starting OAuth before connect");
+          const oauthReady = await handleAuthError(
+            new Error("Missing Authorization header"),
+            url,
+            false,
+            retryCount,
+          );
+          token = (await serverAuthProvider.tokens())?.access_token;
+          if (!oauthReady && !token) {
+            return;
+          }
+          updateState({ status: "connecting", serverUrl: url, error: null });
+        }
       }
       
       if (token) {
@@ -363,8 +451,9 @@ export function useMcpConnection({
 
       // Create transport using our proxy - environment-aware URL
       const transportOptions: StreamableHTTPClientTransportOptions = {
-        // Only include authProvider if we're NOT using manual bearer token
-        ...(bearerToken ? {} : { authProvider: serverAuthProvider }),
+        // OAuth is handled in handleAuthError with the real MCP server URL.
+        // Passing authProvider here would run auth() against the CloudFront proxy URL
+        // and can break PKCE / resource binding (invalid_grant on token exchange).
         requestInit: {
           headers,
         },
@@ -393,6 +482,7 @@ export function useMcpConnection({
       
       setClient(mcpClient);
       updateState({ status: "connected" });
+      sessionStorage.removeItem(SESSION_KEYS.PENDING_CONNECT_URL);
 
       // Load server data
       await loadServerData(mcpClient);
@@ -401,19 +491,18 @@ export function useMcpConnection({
       console.error("Connection failed:", error);
       
       // Handle auth errors - exactly like Inspector
-      const shouldRetry = await handleAuthError(error, url);
+      const shouldRetry = await handleAuthError(error, url, false, retryCount);
       
       if (shouldRetry) {
         return connect(url, retryCount + 1);
       }
       
-      // If it's a 401 error but auth failed, don't set error state (user might be redirected)
-      // UNLESS we're using a manual bearer token, in which case we should show the error
-      if (is401Error(error)) {
-        if (bearerToken) {
-          // Manual bearer token failed - show the error
-          handleError(error instanceof Error ? error : new Error(String(error)));
-        }
+      if (isAuthRequiredError(error) && !bearerToken) {
+        handleError(
+          new Error(
+            "Authentication did not complete. Verify OAuth redirect URI and client credentials, then try again.",
+          ),
+        );
         return;
       }
       
